@@ -46,7 +46,9 @@ static void empty_pack_stage(int full, int from_version, int to_version, char *m
 	// clean any stale data (eg: re-run after a failure)
 	string_or_die(&param, "%s/%s/%i_to_%i/", packstage_dir, module, from_version, to_version);
 	char *const rmcmd[] = { "rm", "-fr", param, NULL };
-	if (system_argv(rmcmd) != 0) {
+	if (true) {
+		LOG(NULL, "Skipping removal of packstage", "%s/%s/%i_to_%i/", packstage_dir, module, from_version, to_version);
+	} else if (system_argv(rmcmd) != 0) {
 		fprintf(stderr, "Failed to clean %s/%s/%i_to_%i\n",
 			packstage_dir, module, from_version, to_version);
 		free(param);
