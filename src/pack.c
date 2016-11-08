@@ -187,6 +187,19 @@ static int stage_entry(struct file *file,
 
 	if (ret) {
 		ret = link(tarfrom, tarto);
+		if (ret && errno == ENOENT && content_url) {
+			LOG(NULL, "Download fallback for pack", "%s: %s to %s", packname, tarfrom, tarto);
+
+			/* Must be "tarfrom" that is missing. Download directly into target location.*/
+			char *cmd;
+			string_or_die(&cmd, "curl -s -o '%s' %s/%d/files/%s.tar",
+				      tarto, content_url, file->last_change, file->hash);
+			if (system(cmd)) {
+				LOG(file, "Downloading failed", "%s", cmd);
+			} else {
+				ret = 0;
+			}
+		}
 		if (ret && errno != EEXIST) {
 			LOG(NULL, "Failure to link for fullfile pack", "%s to %s (%s) %i", tarfrom, tarto, strerror(errno), errno);
 		}
