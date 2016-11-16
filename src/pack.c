@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "swupd.h"
+#include "xattrs.h"
 
 static void empty_pack_stage(int full, int from_version, int to_version, char *module)
 {
@@ -149,6 +150,51 @@ static void prepare_pack(struct packdata *pack)
 	link_renames(pack->end_manifest->files, pack->to);
 }
 
+static int stage_entry(struct file *file,
+		       const char *fullfrom, const char *fullto,
+		       const char *tarfrom, const char *tarto,
+		       const char *packname)
+{
+	int ret;
+
+	/* Prefer to hardlink uncompressed files or replicate
+	 * directories first, and fall back to the compressed
+	 * versions if that failed.
+	 */
+	if (!file->is_dir) {
+		ret = link(fullfrom, fullto);
+		if (ret && errno == EEXIST) {
+			ret = 0;
+		} else if (ret) {
+			LOG(NULL, "Failure to link for pack", "%s: %s to %s (%s) %i", packname, fullfrom, fullto, strerror(errno), errno);
+		}
+	} else {
+		/* Replicate directory. */
+		struct stat st;
+		if ((stat(fullfrom, &st) ||
+		     mkdir(fullto, 0) ||
+		     chmod(fullto, st.st_mode) ||
+		     chown(fullto, st.st_uid, st.st_gid) ||
+		     (xattrs_copy(fullfrom, fullto), false)) &&
+		    errno != EEXIST) {
+			LOG(NULL, "Failure to replicate dir for pack", "%s: %s to %s (%s) %i", packname, fullfrom, fullto, strerror(errno), errno);
+			rmdir(fullto);
+			ret = -1;
+		} else {
+			ret = 0;
+		}
+	}
+
+	if (ret) {
+		ret = link(tarfrom, tarto);
+		if (ret && errno != EEXIST) {
+			LOG(NULL, "Failure to link for fullfile pack", "%s to %s (%s) %i", tarfrom, tarto, strerror(errno), errno);
+		}
+	}
+
+	return ret;
+}
+
 static void make_pack_full_files(struct packdata *pack)
 {
 	GList *item;
@@ -168,32 +214,18 @@ static void make_pack_full_files(struct packdata *pack)
 			char *fullfrom, *fullto;
 
 			/* hardlink each file that is in <end> but not in <X> */
-			string_or_die(&fullfrom, "%s/%i/full/%s", image_dir, file->last_change, file->filename);
+			string_or_die(&fullfrom, "%s/%i/full/%s", image_dir, pack->to, file->filename);
 			string_or_die(&fullto, "%s/%s/%i_to_%i/staged/%s", packstage_dir,
 				      pack->module, pack->from, pack->to, file->hash);
 			string_or_die(&from, "%s/%i/files/%s.tar", staging_dir, file->last_change, file->hash);
 			string_or_die(&to, "%s/%s/%i_to_%i/staged/%s.tar", packstage_dir,
 				      pack->module, pack->from, pack->to, file->hash);
 
-			ret = -1;
-			errno = 0;
-
-			/* Prefer to hardlink uncompressed files (excluding
-			 * directories) first, and fall back to the compressed
-			 * versions if the hardlink fails.
+			/* Prefer to hardlink uncompressed files or replicate
+			 * directories first, and fall back to the compressed
+			 * versions if that failed.
 			 */
-			if (!file->is_dir) {
-				ret = link(fullfrom, fullto);
-				if (ret && errno != EEXIST) {
-					LOG(NULL, "Failure to link for fullfile pack", "%s to %s (%s) %i", fullfrom, fullto, strerror(errno), errno);
-				}
-			}
-			if (ret) {
-				ret = link(from, to);
-				if (ret && errno != EEXIST) {
-					LOG(NULL, "Failure to link for fullfile pack", "%s to %s (%s) %i", from, to, strerror(errno), errno);
-				}
-			}
+			ret = stage_entry(file, fullfrom, fullto, from, to, "fullfile");
 
 			if (ret == 0) {
 				pack->fullcount++;
@@ -270,17 +302,18 @@ static GList *consolidate_packs_delta_files(GList *files, struct packdata *pack)
 	return files;
 }
 
-static void create_delta(gpointer data, __unused__ gpointer user_data)
+static void create_delta(gpointer data, gpointer user_data)
 {
 	struct file *file = data;
+	int *to_version = user_data;
 
 	/* if the file was not found in the from version, skip delta creation */
 	if (file->peer) {
-		__create_delta(file, file->peer->last_change, file->peer->hash);
+		__create_delta(file, file->peer->last_change, *to_version, file->peer->hash);
 	}
 }
 
-static void make_pack_deltas(GList *files)
+static void make_pack_deltas(GList *files, int to_version)
 {
 	GThreadPool *threadpool;
 	GList *item;
@@ -290,7 +323,7 @@ static void make_pack_deltas(GList *files)
 	int numthreads = num_threads(1.0);
 
 	LOG(NULL, "pack deltas threadpool", "%d threads", numthreads);
-	threadpool = g_thread_pool_new(create_delta, NULL,
+	threadpool = g_thread_pool_new(create_delta, &to_version,
 				       numthreads, FALSE, NULL);
 
 	item = g_list_first(files);
@@ -347,7 +380,7 @@ static int make_final_pack(struct packdata *pack)
 			      file->last_change, file->hash);
 		string_or_die(&tarto, "%s/%s/%i_to_%i/staged/%s.tar", packstage_dir,
 			      pack->module, pack->from, pack->to, file->hash);
-		string_or_die(&fullfrom, "%s/%i/full/%s", image_dir, file->last_change, file->filename);
+		string_or_die(&fullfrom, "%s/%i/full/%s", image_dir, pack->to, file->filename);
 		string_or_die(&fullto, "%s/%s/%i_to_%i/staged/%s", packstage_dir,
 			      pack->module, pack->from, pack->to, file->hash);
 
@@ -381,27 +414,7 @@ static int make_final_pack(struct packdata *pack)
 				}
 			}
 		} else {
-			ret = -1;
-			errno = 0;
-
-			/* Prefer to hardlink uncompressed files (excluding
-			 * directories) first, and fall back to the compressed
-			 * versions if the hardlink fails.
-			 */
-			if (!file->is_dir) {
-				ret = link(fullfrom, fullto);
-				if (ret && errno != EEXIST) {
-					LOG(NULL, "Failure to link for final pack", "%s to %s (%s) %i\n", fullfrom, fullto, strerror(errno), errno);
-				}
-			}
-
-			if (ret) {
-				ret = link(tarfrom, tarto);
-				if (ret && errno != EEXIST) {
-					LOG(NULL, "Failure to link for final pack", "%s to %s (%s) %i\n", tarfrom, tarto, strerror(errno), errno);
-				}
-			}
-
+			ret = stage_entry(file, fullfrom, fullto, tarfrom, tarto, "final");
 			if (ret == 0) {
 				pack->fullcount++;
 			}
@@ -512,7 +525,7 @@ int make_pack(struct packdata *pack)
 
 	/* step 2: consolidate delta list & create all delta files*/
 	delta_list = consolidate_packs_delta_files(delta_list, pack);
-	make_pack_deltas(delta_list);
+	make_pack_deltas(delta_list, pack->to);
 	g_list_free(delta_list);
 
 	/* step 3: complete pack creation */
