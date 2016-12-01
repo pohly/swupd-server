@@ -81,11 +81,14 @@ static bool type_has_changed(struct file *file)
 	if (((type1 == 'F') && (type2 == 'L')) ||
 	    ((type1 == 'F') && (type2 == 'D')) ||
 	    ((type1 == 'L') && (type2 == 'F')) ||
-	    ((type1 == 'L') && (type2 == 'D'))) {
+	    ((type1 == 'L') && (type2 == 'D')) ||
+	    ((type1 == 'D') && (type2 == 'L' || type2 == 'F'))) {
 		/* 1) file to symlink is an OK transition
 		 * 2) file to directory is an OK transition
 		 * 3) symlink to file is an OK transition
 		 * 4) symlink to directory is an OK transition
+		 * 5) *empty* directory to something else is an OK transition,
+		 *    so we allow it although the non-empty case doesn't work
 		 */
 		return false;
 	}
